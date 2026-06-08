@@ -2091,7 +2091,7 @@ def train_rl(fresh_rl_from_sl=False):
 # ============================================================
 
 
-def main_nefeli(args):
+def main(args):
     if args.command == "prepare_sl":
         prepare_sl_shards_from_pgn(pgn_path=args.pgn, shard_size=args.sl_shard_size, value_min_ply=args.sl_value_min_ply, value_positions_per_game=args.sl_value_positions_per_game)
 
@@ -2126,7 +2126,7 @@ if __name__ == "__main__":
     parser.add_argument("--fresh-rl-from-sl", action="store_true")
 
     args = parser.parse_args()
-    main_nefeli(args)
+    main(args)
 
 
 
