@@ -33,5 +33,4 @@ python -u chess-agent.py train_sl \
   --pgn $HOME/chess-agent-aristotle/data/lichess_elite_2024-07.pgn \
   --sl-epochs 6 \
   --sl-value-min-ply 10 \
-  --sl-value-positions-per-game 5 \
-  --force-prepare
+  --sl-value-positions-per-game 5 

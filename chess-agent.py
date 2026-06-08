@@ -769,7 +769,7 @@ def train_sl_one_epoch(model, optimizer, device, shard_paths, epoch_idx, num_epo
     }
 
 
-def train_sl(pgn_path=DEFAULT_PGN_PATH, sl_epochs=SL_EPOCHS, value_min_ply=SL_VALUE_MIN_PLY, value_positions_per_game=SL_VALUE_POSITIONS_PER_GAME, force_prepare=False):
+def train_sl(pgn_path=DEFAULT_PGN_PATH, sl_epochs=SL_EPOCHS, value_min_ply=SL_VALUE_MIN_PLY, value_positions_per_game=SL_VALUE_POSITIONS_PER_GAME, force_prepare=False, resume=True):
     print("Device:", DEVICE, flush=True)
     print("Project:", PROJECT_DIR, flush=True)
     print("PGN:", pgn_path, flush=True)
@@ -779,6 +779,7 @@ def train_sl(pgn_path=DEFAULT_PGN_PATH, sl_epochs=SL_EPOCHS, value_min_ply=SL_VA
     print("SL value loss weight:", SL_VALUE_LOSS_WEIGHT, flush=True)
     print("SL value min ply:", value_min_ply, flush=True)
     print("SL value positions per game:", value_positions_per_game, flush=True)
+    print("SL resume:", resume, flush=True)
 
     shard_paths = list_sl_shards()
 
@@ -794,8 +795,31 @@ def train_sl(pgn_path=DEFAULT_PGN_PATH, sl_epochs=SL_EPOCHS, value_min_ply=SL_VA
     optimizer = torch.optim.AdamW(model.parameters(), lr=SL_LR, weight_decay=WEIGHT_DECAY)
 
     all_metrics = []
+    start_epoch = 1
 
-    for epoch in range(1, sl_epochs + 1):
+    if resume and SL_LATEST_PATH.exists():
+        print("Resuming SL from:", SL_LATEST_PATH, flush=True)
+
+        ckpt = torch.load(SL_LATEST_PATH, map_location=DEVICE, weights_only=False)
+
+        model.load_state_dict(ckpt["model_state_dict"])
+
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            print("Loaded SL optimizer state.", flush=True)
+
+        completed_epoch = int(ckpt.get("epoch", 0))
+        all_metrics = ckpt.get("all_metrics", [])
+
+        start_epoch = completed_epoch + 1
+
+        print(f"Resumed SL after epoch {completed_epoch}. Continuing from epoch {start_epoch}.", flush=True)
+
+    if start_epoch > sl_epochs:
+        print(f"SL already completed: checkpoint epoch={start_epoch - 1}, target sl_epochs={sl_epochs}", flush=True)
+        return
+
+    for epoch in range(start_epoch, sl_epochs + 1):
         metrics = train_sl_one_epoch(model=model, optimizer=optimizer, device=DEVICE, shard_paths=shard_paths, epoch_idx=epoch, num_epochs=sl_epochs)
 
         all_metrics.append(metrics)
@@ -908,9 +932,7 @@ class MCTSNode:
         self.children = {}
         self.N = 0
         self.W = 0.0
-        self.terminal_value = (
-            mcts_terminal_value_for_side_to_move(board) if board is not None else None
-        )
+        self.terminal_value = (mcts_terminal_value_for_side_to_move(board) if board is not None else None)
 
     @property
     def Q(self):
@@ -1006,127 +1028,15 @@ def expand_node_with_policy_logits(node, policy_logits_np):
         node.terminal_value = 0.0
         return
 
-    legal_indices = np.fromiter(
-        (move_to_id(move, board) for move in legal_moves),
-        dtype=np.int64,
-        count=len(legal_moves),
-    )
+    legal_indices = np.fromiter((move_to_id(move, board) for move in legal_moves), dtype=np.int64, count=len(legal_moves))
 
     priors = softmax_np(policy_logits_np[legal_indices])
 
     # Lazy children: no child Board copies here.
     for move, prior in zip(legal_moves, priors):
-        node.children[move] = MCTSNode(
-            board=None,
-            parent=node,
-            move=move,
-            prior=float(prior),
-        )
+        node.children[move] = MCTSNode(board=None, parent=node, move=move, prior=float(prior))
 
 
-@torch.no_grad()
-def batch_evaluate_and_expand(nodes, model, device):
-    if len(nodes) == 0:
-        return []
-
-    values = [None] * len(nodes)
-    eval_indices = []
-    eval_tensors = []
-
-    for idx, node in enumerate(nodes):
-        board = materialize_node_board(node)
-
-        if node.terminal_value is not None:
-            values[idx] = float(node.terminal_value)
-            continue
-
-        eval_indices.append(idx)
-        eval_tensors.append(board_to_tensor(board))
-
-    if len(eval_indices) > 0:
-        x_np = np.stack(eval_tensors).astype(np.float32, copy=False)
-        x = torch.from_numpy(x_np).to(device, non_blocking=True)
-
-        torch_device = torch.device(device)
-        use_cuda = torch_device.type == "cuda"
-
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
-            policy_logits_batch, value_batch = model(x)
-
-        policy_logits_batch = policy_logits_batch.detach().float().cpu().numpy()
-        value_batch = value_batch.detach().float().view(-1).cpu().numpy()
-
-        for batch_idx, node_idx in enumerate(eval_indices):
-            node = nodes[node_idx]
-            policy_logits_np = policy_logits_batch[batch_idx].reshape(-1)
-
-            expand_node_with_policy_logits(node, policy_logits_np)
-            values[node_idx] = float(value_batch[batch_idx])
-
-    return values
-
-
-def run_mcts_batch(
-    boards,
-    model,
-    device,
-    num_simulations,
-    c_puct,
-    add_noise=False,
-    dirichlet_alpha=0.3,
-    dirichlet_epsilon=0.25,
-):
-    model.eval()
-
-    roots = [MCTSNode(board.copy(stack=False)) for board in boards]
-
-    batch_evaluate_and_expand(roots, model, device)
-
-    if add_noise:
-        for root in roots:
-            add_dirichlet_noise_to_root(
-                root,
-                alpha=dirichlet_alpha,
-                epsilon=dirichlet_epsilon,
-            )
-
-    for _ in range(num_simulations):
-        leaves = [select_leaf(root, c_puct=c_puct) for root in roots]
-        values = batch_evaluate_and_expand(leaves, model, device)
-
-        for leaf, value in zip(leaves, values):
-            backup(leaf, value)
-
-    return roots
-
-
-@torch.no_grad()
-def evaluate_and_expand(node, model, device):
-    values = batch_evaluate_and_expand([node], model, device)
-    return values[0]
-
-
-def run_mcts(
-    board,
-    model,
-    device,
-    num_simulations,
-    c_puct,
-    add_noise=False,
-    dirichlet_alpha=0.3,
-    dirichlet_epsilon=0.25,
-):
-    roots = run_mcts_batch(
-        boards=[board],
-        model=model,
-        device=device,
-        num_simulations=num_simulations,
-        c_puct=c_puct,
-        add_noise=add_noise,
-        dirichlet_alpha=dirichlet_alpha,
-        dirichlet_epsilon=dirichlet_epsilon,
-    )
-    return roots[0]
 
 def root_visit_policy(root):
     board = root.board
@@ -1440,40 +1350,41 @@ def finalize_self_play_data(game_history, result):
     return final_data
 
 
-def save_selfplay_partial(path, iteration, num_games, num_simulations, completed_games, vector_batch_games=None):
+def save_selfplay_partial(path, iteration, num_games, num_simulations, completed_games, worker_vector_games=None):
     payload = {
-        "iteration": iteration,
-        "num_games": num_games,
-        "num_simulations": num_simulations,
-        "vector_batch_games": vector_batch_games,
-        "mode": "vectorized",
+        "iteration": int(iteration),
+        "num_games": int(num_games),
+        "num_simulations": int(num_simulations),
+        "worker_vector_games": int(worker_vector_games) if worker_vector_games is not None else None,
+        "mode": "parallel_inference",
         "completed_games": completed_games,
         "saved_at": time.time(),
     }
+
     tmp_path = Path(str(path) + ".tmp")
     torch.save(payload, tmp_path)
     tmp_path.replace(path)
 
 
-def load_matching_selfplay_partial(path, iteration, num_games, num_simulations, vector_batch_games=None):
+def load_matching_selfplay_partial(path, iteration, num_games, num_simulations, worker_vector_games=None):
     path = Path(path)
 
     if not path.exists():
         return []
 
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        print(f"Could not load partial self-play checkpoint {path}: {e}", flush=True)
+        return []
 
-    if (
-        ckpt.get("iteration") != iteration
-        or ckpt.get("num_games") != num_games
-        or ckpt.get("num_simulations") != num_simulations
-        or ckpt.get("mode") != "vectorized"
-        or ckpt.get("vector_batch_games") != vector_batch_games
-    ):
+    if (ckpt.get("iteration") != int(iteration) or ckpt.get("num_games") != int(num_games) or ckpt.get("num_simulations") != int(num_simulations) 
+            or ckpt.get("mode") != "parallel_inference" or ckpt.get("worker_vector_games") != (int(worker_vector_games) if worker_vector_games is not None else None)):
         return []
 
     completed = ckpt.get("completed_games", [])
-    print(f"Loaded partial vectorized self-play: {len(completed)}/{num_games} games", flush=True)
+
+    print(f"Loaded partial parallel self-play: {len(completed)}/{num_games} games", flush=True)
 
     return completed
 
@@ -1494,11 +1405,7 @@ def selfplay_worker_loop(worker_id, game_indices, request_q, response_q, result_
 
         torch.set_num_threads(1)
 
-        seed = (
-            int(time.time() * 1000)
-            + 100003 * int(worker_id)
-            + 1009 * int(iteration)
-        ) % (2**32 - 1)
+        seed = (int(time.time() * 1000) + 100003 * int(worker_id) + 1009 * int(iteration)) % (2**32 - 1)
 
         random.seed(seed)
         np.random.seed(seed)
@@ -1553,11 +1460,7 @@ def selfplay_worker_loop(worker_id, game_indices, request_q, response_q, result_
                     pi, moves, probs = root_visit_policy(root)
 
                     if len(moves) == 0:
-                        result = (
-                            board.result(claim_draw=True)
-                            if board.is_game_over(claim_draw=True)
-                            else "1/2-1/2"
-                        )
+                        result = (board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "1/2-1/2")
                         done[local_idx] = True
                         register_completed_game(local_idx, result)
                         continue
@@ -1630,60 +1533,86 @@ def generate_self_play_games_parallel_inference(model, replay_buffer, num_games,
         flush=True,
     )
 
+     # ---------------------------------------------------------
+    # Load partial completed games for this iteration, if any.
+    # These are finalized games from a previous interrupted run.
+    # ---------------------------------------------------------
+
+    completed_games = load_matching_selfplay_partial(SELFPLAY_PARTIAL_PATH, iteration=iteration, num_games=num_games, num_simulations=num_simulations,
+        worker_vector_games=worker_vector_games)
+
+    completed_indices = set()
+    total_positions = 0
+    new_positions = 0
+
+    for item in completed_games:
+        game_idx = int(item["game_idx"])
+
+        if game_idx in completed_indices:
+            continue
+
+        completed_indices.add(game_idx)
+
+        data = item["data"]
+        replay_buffer.extend(data)
+
+        positions = len(data)
+        total_positions += positions
+        new_positions += positions
+
+    if len(completed_games) >= num_games:
+        print("All self-play games were already completed in partial checkpoint.", flush=True)
+
+        completed_games = sorted(completed_games, key=lambda x: x["game_idx"])
+        results = [item["result"] for item in completed_games]
+
+        counts = Counter(results)
+
+        print("Parallel self-play result counts:", {
+            "1-0": counts.get("1-0", 0),
+            "0-1": counts.get("0-1", 0),
+            "1/2-1/2": counts.get("1/2-1/2", 0),
+        }, flush=True)
+
+        print("New positions this iteration:", new_positions, flush=True)
+        print("Buffer size:", len(replay_buffer), flush=True)
+
+        return results, new_positions
+
     ctx = mp.get_context("spawn")
 
     request_q = ctx.Queue(maxsize=max(64, num_workers * 8))
     result_q = ctx.Queue()
     response_queues = [ctx.Queue(maxsize=32) for _ in range(num_workers)]
 
-    model_state_dict_cpu = {
-        k: v.detach().cpu()
-        for k, v in model.state_dict().items()
-    }
+    model_state_dict_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
-    server_proc = ctx.Process(
-        target=inference_server_loop,
-        args=(
-            model_state_dict_cpu,
-            request_q,
-            response_queues,
-            str(DEVICE),
-            int(server_batch_size),
-            int(server_timeout_ms),
-        ),
-    )
+    server_proc = ctx.Process(target=inference_server_loop, args=(model_state_dict_cpu, request_q, response_queues, str(DEVICE), int(server_batch_size), int(server_timeout_ms)))
 
     server_proc.start()
 
-    all_indices = list(range(num_games))
-    game_chunks = [all_indices[i::num_workers] for i in range(num_workers)]
+    remaining_indices = [i for i in range(num_games) if i not in completed_indices]
+
+    if len(remaining_indices) == 0:
+        game_chunks = [[] for _ in range(num_workers)]
+    else:
+        num_workers = int(min(num_workers, len(remaining_indices)))
+        num_workers = max(1, num_workers)
+        game_chunks = [remaining_indices[i::num_workers] for i in range(num_workers)]
 
     workers = []
 
     for worker_id in range(num_workers):
-        p = ctx.Process(
-            target=selfplay_worker_loop,
-            args=(
-                worker_id,
-                game_chunks[worker_id],
-                request_q,
-                response_queues[worker_id],
-                result_q,
-                int(num_simulations),
-                int(worker_vector_games),
-                int(iteration),
-            ),
-        )
+        p = ctx.Process(target=selfplay_worker_loop, args=(worker_id, game_chunks[worker_id], request_q, response_queues[worker_id], result_q, int(num_simulations),
+                int(worker_vector_games), int(iteration)))
         p.start()
         workers.append(p)
 
-    completed_games = []
-    completed_indices = set()
-    total_positions = 0
-    new_positions = 0
     workers_done = 0
+    last_partial_save_time = time.time()
+    last_partial_save_games = len(completed_games)
 
-    pbar = tqdm(total=num_games, desc="Parallel self-play", file=sys.stdout, dynamic_ncols=True)
+    pbar = tqdm(total=num_games, initial=len(completed_games), desc="Parallel self-play", file=sys.stdout, dynamic_ncols=True)
 
     start_time = time.time()
 
@@ -1710,6 +1639,20 @@ def generate_self_play_games_parallel_inference(model, replay_buffer, num_games,
                 total_positions += positions
                 new_positions += positions
 
+                now = time.time()
+
+                should_save_partial = (len(completed_games) - last_partial_save_games >= PARTIAL_SAVE_EVERY_GAMES or now - last_partial_save_time >= PARTIAL_SAVE_EVERY_SECONDS
+                    or len(completed_games) >= num_games)
+
+                if should_save_partial:
+                    save_selfplay_partial(SELFPLAY_PARTIAL_PATH, iteration=iteration, num_games=num_games, num_simulations=num_simulations, completed_games=completed_games,
+                        worker_vector_games=worker_vector_games)
+
+                    print(f"\nSaved partial self-play checkpoint: " f"{len(completed_games)}/{num_games} games -> {SELFPLAY_PARTIAL_PATH}", flush=True)
+
+                    last_partial_save_time = now
+                    last_partial_save_games = len(completed_games)
+
                 results_so_far = [x["result"] for x in completed_games]
                 counts = Counter(results_so_far)
 
@@ -1730,10 +1673,7 @@ def generate_self_play_games_parallel_inference(model, replay_buffer, num_games,
                 workers_done += 1
 
                 if workers_done == num_workers and len(completed_games) < num_games:
-                    raise RuntimeError(
-                        f"All workers finished but only got "
-                        f"{len(completed_games)}/{num_games} games."
-                    )
+                    raise RuntimeError(f"All workers finished but only got " f"{len(completed_games)}/{num_games} games.")
 
             elif tag == "worker_error":
                 _, worker_id, err_text = msg
@@ -1760,6 +1700,11 @@ def generate_self_play_games_parallel_inference(model, replay_buffer, num_games,
         if server_proc.is_alive():
             server_proc.terminate()
             server_proc.join(timeout=5)
+
+    save_selfplay_partial(SELFPLAY_PARTIAL_PATH, iteration=iteration, num_games=num_games, num_simulations=num_simulations, completed_games=completed_games,
+        worker_vector_games=worker_vector_games)
+
+    print(f"Saved final partial self-play checkpoint before training: " f"{len(completed_games)}/{num_games} games -> {SELFPLAY_PARTIAL_PATH}", flush=True)
 
     completed_games = sorted(completed_games, key=lambda x: x["game_idx"])
     results = [item["result"] for item in completed_games]
@@ -1872,12 +1817,7 @@ def train_rl_fixed_steps(model, replay_buffer, optimizer, device, batch_size, ne
 
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
 
-    pbar = tqdm(
-        range(train_steps),
-        desc="RL training",
-        file=sys.stdout,
-        dynamic_ncols=True,
-    )
+    pbar = tqdm(range(train_steps), desc="RL training", file=sys.stdout, dynamic_ncols=True)
 
     for _ in pbar:
         X, pi, z, legal_mask = sample_batch_from_replay_buffer(replay_buffer_list, batch_size)
@@ -2003,9 +1943,7 @@ def train_rl(fresh_rl_from_sl=False):
                 break
 
         if ckpt is None:
-            raise RuntimeError(
-                "No checkpoint found. Run supervised training first or copy a model checkpoint."
-            )
+            raise RuntimeError("No checkpoint found. Run supervised training first or copy a model checkpoint.")
 
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer = torch.optim.AdamW(model.parameters(), lr=RL_LR, weight_decay=WEIGHT_DECAY)
@@ -2111,6 +2049,10 @@ def train_rl(fresh_rl_from_sl=False):
 
         torch.save(checkpoint, RL_LATEST_PATH)
         print("Saved full RL checkpoint:", RL_LATEST_PATH, flush=True)
+
+        if SELFPLAY_PARTIAL_PATH.exists():
+            SELFPLAY_PARTIAL_PATH.unlink()
+            print("Deleted completed partial self-play checkpoint:", SELFPLAY_PARTIAL_PATH, flush=True)
 
         # -----------------------------------------------------
         # 4. Save archival checkpoint WITHOUT replay buffer
