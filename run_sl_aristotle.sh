@@ -29,7 +29,7 @@ mkdir -p "$SL_SHARD_DIR"
 
 echo "Using SL_SHARD_DIR=$SL_SHARD_DIR"
 
-python -u chess-agent.py train_sl \
+python -u chess_agent.py train_sl \
   --pgn $HOME/chess-agent-aristotle/data/lichess_elite_2024-07.pgn \
   --sl-epochs 6 \
   --sl-value-min-ply 10 \

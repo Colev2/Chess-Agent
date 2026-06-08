@@ -17,10 +17,13 @@ module load gcc/14.2.0
 cd $HOME/chess-agent-aristotle
 source ~/pytorch-env/bin/activate
 
+: "${SCRATCH:?SCRATCH is not set}"
+
+export CHESS_SCRATCH_OUTPUT_DIR="$SCRATCH/chess-agent-aristotle/outputs"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 
-python -u chess-agent.py train_rl --fresh-rl-from-sl
+python -u chess_agent.py train_rl --fresh-rl-from-sl

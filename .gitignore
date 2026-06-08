@@ -1,4 +1,8 @@
 outputs/
+*.pgn
+*.csv
+*.pt
+logs/
 data/
 *.pt
 *.pth
