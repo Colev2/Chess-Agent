@@ -1,0 +1,11 @@
+outputs/
+data/
+*.pt
+*.pth
+*.pgn
+*.zip
+*.pkl
+*.npz
+runs/
+__pycache__/
+*.pyc
