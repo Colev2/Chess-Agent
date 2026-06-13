@@ -3,32 +3,55 @@
 # ============================================================
 # eval_checkpoints.py
 #
-# External checkpoint evaluator for AlphaZero-style chess agent.
+# External evaluator for the current/latest archived RL checkpoint.
 #
-# Usage:
-#   python -u eval_checkpoints.py --games 40 --sims 100 --step 5
+# Main goal:
+#   Periodically answer whether the current agent is improving.
 #
-# This script:
-#   - imports model/encoding/path definitions from chess_agent.py
-#   - scans model_iter_*.pt checkpoints
-#   - matches each checkpoint against model_after_sl.pt
-#   - also matches model_iter_N against model_iter_(N-step)
-#   - writes CSV summary
-#   - appends PGN games
-#   - optionally runs Ordo if installed
+# Default match plan with --step 5:
+#   latest model_iter_N      vs model_after_sl
+#   latest model_iter_N      vs model_iter_(N-5), if available
+#
+# Evaluation style:
+#   - deterministic MCTS: no Dirichlet noise, no temperature
+#   - many starting FENs; by default the script generates enough legal
+#     deterministic opening-like FENs so each FEN is used once with each color
+#   - batched/vectorized game evaluation in one process, with both models
+#     loaded once on the same device
+#   - batched NN inference inside each MCTS simulation across active games
+#
+# Example quick check:
+#   python -u eval_checkpoints.py --games 100 --sims 100 --step 5 --no-ordo
+#
+# Example stronger check:
+#   python -u eval_checkpoints.py --games 500 --sims 300 --step 5 --batch-games 64 --no-ordo
+#
+# Example with curated FENs:
+#   python -u eval_checkpoints.py --games 500 --sims 300 --fen-file eval_fens.txt
+#
+# FEN file format:
+#   Either plain FEN per line, or:
+#       Name | fen-string
+#   Lines beginning with # are ignored.
 # ============================================================
+
+from __future__ import annotations
 
 import argparse
 import csv
 import math
+import random
 import re
 import shutil
 import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import chess
 import chess.pgn
 import torch
@@ -43,6 +66,7 @@ import chess_agent
 
 ChessNet = chess_agent.ChessNet
 board_to_tensor = chess_agent.board_to_tensor
+NUM_MOVES = getattr(chess_agent, "NUM_MOVES", 4672)
 
 OUTPUT_DIR = getattr(chess_agent, "OUTPUT_DIR", Path("outputs"))
 RL_MODEL_DIR = getattr(
@@ -72,30 +96,16 @@ MAX_GAME_MOVES = getattr(chess_agent, "MAX_GAME_MOVES", 250)
 # ============================================================
 
 EVAL_DIR = OUTPUT_DIR / "eval"
-EVAL_RESULTS_CSV = EVAL_DIR / "eval_results.csv"
-EVAL_GAMES_PGN = EVAL_DIR / "eval_games.pgn"
-EVAL_ORDO_RATINGS_TXT = EVAL_DIR / "ordo_ratings.txt"
+EVAL_RESULTS_CSV = EVAL_DIR / "eval_latest_results.csv"
+EVAL_GAMES_PGN = EVAL_DIR / "eval_latest_games.pgn"
+EVAL_ORDO_RATINGS_TXT = EVAL_DIR / "ordo_latest_ratings.txt"
 
 
 # ============================================================
-# Opening / starting positions for evaluation
+# Base opening / starting positions
 # ============================================================
-#
-# These are not used in training. They are only for external evaluation.
-#
-# Scheduling rule:
-#   game 0: FEN 0, checkpoint White
-#   game 1: FEN 0, checkpoint Black
-#   game 2: FEN 1, checkpoint White
-#   game 3: FEN 1, checkpoint Black
-#   ...
-#
-# With default --games 40 and 10 FENs:
-#   each FEN is played 4 times per match:
-#     - 2 times with checkpoint as White
-#     - 2 times with checkpoint as Black
 
-STARTING_POSITIONS = [
+BASE_STARTING_POSITIONS = [
     (
         "Ruy Lopez",
         "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
@@ -143,7 +153,7 @@ STARTING_POSITIONS = [
 # Data structures
 # ============================================================
 
-@dataclass
+@dataclass(frozen=True)
 class EvalCheckpoint:
     name: str
     path: Path
@@ -176,6 +186,21 @@ class EvalMCTSNode:
         }
 
 
+@dataclass
+class ActiveEvalGame:
+    game_idx: int
+    board: chess.Board
+    played_moves: list[chess.Move]
+    checkpoint_is_white: bool
+    white_name: str
+    black_name: str
+    opening_name: Optional[str]
+    initial_fen: Optional[str]
+    done: bool = False
+    result: Optional[str] = None
+    termination: Optional[str] = None
+
+
 # ============================================================
 # Checkpoint loading
 # ============================================================
@@ -204,7 +229,6 @@ def extract_model_state_dict(checkpoint_obj) -> dict:
             if key in checkpoint_obj and isinstance(checkpoint_obj[key], dict):
                 return strip_module_prefix(checkpoint_obj[key])
 
-        # Raw state_dict case.
         if all(torch.is_tensor(v) for v in checkpoint_obj.values()):
             return strip_module_prefix(checkpoint_obj)
 
@@ -212,13 +236,6 @@ def extract_model_state_dict(checkpoint_obj) -> dict:
 
 
 def create_eval_model(device: torch.device):
-    """
-    Creates the model architecture.
-
-    If your ChessNet constructor requires arguments, edit this function.
-    For your current code, ChessNet() should probably be enough.
-    """
-
     try:
         model = ChessNet()
     except TypeError as exc:
@@ -250,50 +267,14 @@ def load_eval_model(checkpoint_path: Path, device: torch.device):
 
 
 # ============================================================
-# Move encoding / board tensor wrappers
+# Move encoding / model output helpers
 # ============================================================
 
 def move_to_policy_index(board: chess.Board, move: chess.Move) -> int:
     return int(chess_agent.move_to_id(move, board))
 
-def board_to_tensor_batch(board: chess.Board, device: torch.device) -> torch.Tensor:
-    """
-    Uses your project's board_to_tensor(board).
-
-    Expected single-board output:
-      [C, 8, 8]
-
-    Returns:
-      [1, C, 8, 8]
-    """
-
-    x = board_to_tensor(board)
-
-    if not torch.is_tensor(x):
-        x = torch.tensor(x)
-
-    x = x.float()
-
-    if x.ndim == 3:
-        x = x.unsqueeze(0)
-
-    if x.ndim != 4:
-        raise RuntimeError(
-            f"board_to_tensor returned unexpected shape: {tuple(x.shape)}"
-        )
-
-    return x.to(device, non_blocking=True)
-
 
 def split_model_output(output):
-    """
-    Supports:
-      - model(x) -> (policy_logits, value)
-      - model(x) -> {"policy": ..., "value": ...}
-
-    Also tries to detect tuple order by shape.
-    """
-
     if isinstance(output, dict):
         policy = output.get("policy", None)
         value = output.get("value", None)
@@ -314,14 +295,12 @@ def split_model_output(output):
         a_flat = a.view(a.shape[0], -1) if torch.is_tensor(a) and a.ndim >= 2 else a
         b_flat = b.view(b.shape[0], -1) if torch.is_tensor(b) and b.ndim >= 2 else b
 
-        # Policy should have 4672 outputs.
-        if torch.is_tensor(a_flat) and a_flat.shape[-1] == 4672:
+        if torch.is_tensor(a_flat) and a_flat.shape[-1] == NUM_MOVES:
             return a, b
 
-        if torch.is_tensor(b_flat) and b_flat.shape[-1] == 4672:
+        if torch.is_tensor(b_flat) and b_flat.shape[-1] == NUM_MOVES:
             return b, a
 
-        # Fallback: assume normal order.
         return a, b
 
     raise RuntimeError(
@@ -331,18 +310,10 @@ def split_model_output(output):
 
 
 # ============================================================
-# Evaluation neural network call
+# Terminal values and batched NN evaluation
 # ============================================================
 
 def terminal_value_from_side_to_move(board: chess.Board) -> float:
-    """
-    Returns terminal value from the perspective of the side to move.
-
-    win for side to move: +1
-    loss for side to move: -1
-    draw: 0
-    """
-
     outcome = board.outcome(claim_draw=True)
 
     if outcome is None:
@@ -355,75 +326,101 @@ def terminal_value_from_side_to_move(board: chess.Board) -> float:
 
 
 @torch.no_grad()
-def eval_policy_value(
+def eval_policy_value_batch(
     model,
-    board: chess.Board,
+    boards: list[chess.Board],
     device: torch.device,
-) -> tuple[dict[chess.Move, float], float]:
+) -> list[tuple[dict[chess.Move, float], float]]:
     """
-    Returns:
-      priors: legal move -> probability
-      value: scalar from side-to-move perspective
+    Batched NN evaluation for many leaf boards belonging to the same model.
+
+    Returns one (legal-move priors, value) pair per board.
+    Value is from the board's side-to-move perspective.
     """
 
-    legal_moves = list(board.legal_moves)
+    if len(boards) == 0:
+        return []
 
-    if not legal_moves:
-        return {}, terminal_value_from_side_to_move(board)
+    results: list[Optional[tuple[dict[chess.Move, float], float]]] = [None] * len(boards)
+    eval_indices: list[int] = []
+    tensors: list[np.ndarray] = []
+    legal_indices_batch: list[list[int]] = []
+    legal_moves_batch: list[list[chess.Move]] = []
 
-    x = board_to_tensor_batch(board, device)
+    for i, board in enumerate(boards):
+        legal_moves = list(board.legal_moves)
 
-    output = model(x)
-    policy_logits, value = split_model_output(output)
+        if not legal_moves:
+            results[i] = ({}, terminal_value_from_side_to_move(board))
+            continue
 
-    policy_logits = policy_logits.view(-1)
-    value = float(value.view(-1)[0].item())
+        legal_indices = [move_to_policy_index(board, move) for move in legal_moves]
 
-    legal_indices = []
-    valid_moves = []
+        x = board_to_tensor(board)
+        if torch.is_tensor(x):
+            x = x.detach().cpu().numpy()
 
-    for move in legal_moves:
-        idx = move_to_policy_index(board, move)
-        legal_indices.append(idx)
-        valid_moves.append(move)
+        eval_indices.append(i)
+        tensors.append(np.asarray(x, dtype=np.float32))
+        legal_indices_batch.append(legal_indices)
+        legal_moves_batch.append(legal_moves)
 
-    legal_idx_tensor = torch.tensor(
-        legal_indices,
-        dtype=torch.long,
-        device=policy_logits.device,
-    )
+    if len(eval_indices) == 0:
+        return [r for r in results if r is not None]
 
-    legal_logits = policy_logits[legal_idx_tensor]
-    legal_probs = F.softmax(legal_logits, dim=0)
+    x_np = np.stack(tensors).astype(np.float32, copy=False)
+    x = torch.from_numpy(x_np).to(device, non_blocking=True)
 
-    if torch.isnan(legal_probs).any() or torch.isinf(legal_probs).any():
-        uniform = 1.0 / len(valid_moves)
-        priors = {move: uniform for move in valid_moves}
-    else:
-        probs_cpu = legal_probs.detach().cpu().tolist()
-        priors = {
-            move: float(prob)
-            for move, prob in zip(valid_moves, probs_cpu)
-        }
+    use_cuda = device.type == "cuda"
+    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
+        output = model(x)
+        policy_logits_batch, value_batch = split_model_output(output)
 
-    return priors, value
+    policy_logits_batch = policy_logits_batch.detach().float()
+    value_np = value_batch.detach().float().view(-1).cpu().numpy()
+
+    for j, original_idx in enumerate(eval_indices):
+        legal_indices = legal_indices_batch[j]
+        legal_moves = legal_moves_batch[j]
+
+        legal_idx_tensor = torch.tensor(
+            legal_indices,
+            dtype=torch.long,
+            device=policy_logits_batch.device,
+        )
+
+        legal_logits = policy_logits_batch[j, legal_idx_tensor]
+        legal_probs = F.softmax(legal_logits, dim=0)
+
+        if torch.isnan(legal_probs).any() or torch.isinf(legal_probs).any():
+            uniform = 1.0 / len(legal_moves)
+            priors = {move: uniform for move in legal_moves}
+        else:
+            probs_cpu = legal_probs.detach().cpu().tolist()
+            priors = {
+                move: float(prob)
+                for move, prob in zip(legal_moves, probs_cpu)
+            }
+
+        results[original_idx] = (priors, float(value_np[j]))
+
+    final = []
+    for r in results:
+        if r is None:
+            raise RuntimeError("Internal error: missing batched eval result.")
+        final.append(r)
+
+    return final
 
 
 # ============================================================
-# Eval-only MCTS
+# Batched eval-only MCTS
 # ============================================================
 
 def select_child(
     node: EvalMCTSNode,
     c_puct: float,
 ) -> tuple[chess.Move, EvalMCTSNode]:
-    """
-    PUCT selection.
-
-    child.value is from the child node's side-to-move perspective.
-    From the parent perspective, that value is -child.value.
-    """
-
     best_score = -1e30
     best_move = None
     best_child = None
@@ -446,67 +443,102 @@ def select_child(
     return best_move, best_child
 
 
-def run_eval_mcts(
+def backup_path(search_path: list[EvalMCTSNode], value: float) -> None:
+    for path_node in reversed(search_path):
+        path_node.visit_count += 1
+        path_node.value_sum += value
+        value = -value
+
+
+def run_eval_mcts_batch(
     model,
-    root_board: chess.Board,
+    root_boards: list[chess.Board],
     device: torch.device,
     num_simulations: int,
     c_puct: float,
-) -> chess.Move:
+) -> list[chess.Move]:
     """
-    Eval-only MCTS.
+    Vectorized/batched eval MCTS for many independent root boards using one model.
 
     Important:
       - no Dirichlet noise
       - no temperature sampling
+      - one leaf per root per simulation round
+      - NN leaf evaluation is batched across all active roots
       - final move is highest visit count
     """
 
-    legal_moves = list(root_board.legal_moves)
+    if len(root_boards) == 0:
+        return []
 
-    if not legal_moves:
-        raise RuntimeError("MCTS called on board with no legal moves.")
+    roots = [EvalMCTSNode(prior=1.0) for _ in root_boards]
 
-    if len(legal_moves) == 1:
-        return legal_moves[0]
+    # Fast exits for forced-move positions.
+    forced_moves: dict[int, chess.Move] = {}
+    active_root_indices: list[int] = []
 
-    root = EvalMCTSNode(prior=1.0)
+    for i, board in enumerate(root_boards):
+        legal_moves = list(board.legal_moves)
+        if not legal_moves:
+            raise RuntimeError("MCTS called on board with no legal moves.")
+        if len(legal_moves) == 1:
+            forced_moves[i] = legal_moves[0]
+        else:
+            active_root_indices.append(i)
 
     for _ in range(num_simulations):
-        board = root_board.copy(stack=False)
-        node = root
-        search_path = [node]
+        leaf_boards: list[chess.Board] = []
+        leaf_paths: list[list[EvalMCTSNode]] = []
 
-        # Selection.
-        while node.expanded and not board.is_game_over(claim_draw=True):
-            move, node = select_child(node, c_puct=c_puct)
-            board.push(move)
-            search_path.append(node)
+        # Selection for one leaf per active root.
+        for root_idx in active_root_indices:
+            board = root_boards[root_idx].copy(stack=False)
+            node = roots[root_idx]
+            search_path = [node]
 
-        # Expansion/evaluation.
-        if board.is_game_over(claim_draw=True):
-            value = terminal_value_from_side_to_move(board)
-        else:
-            priors, value = eval_policy_value(model, board, device)
-            node.expand(priors)
+            while node.expanded and not board.is_game_over(claim_draw=True):
+                move, node = select_child(node, c_puct=c_puct)
+                board.push(move)
+                search_path.append(node)
 
-        # Backup.
-        # value is from current node side-to-move perspective.
-        # Each step upward flips perspective.
-        for path_node in reversed(search_path):
-            path_node.visit_count += 1
-            path_node.value_sum += value
-            value = -value
+            if board.is_game_over(claim_draw=True):
+                value = terminal_value_from_side_to_move(board)
+                backup_path(search_path, value)
+            else:
+                leaf_boards.append(board)
+                leaf_paths.append(search_path)
 
-    if not root.children:
-        return legal_moves[0]
+        if leaf_boards:
+            eval_results = eval_policy_value_batch(model, leaf_boards, device)
 
-    best_move, best_child = max(
-        root.children.items(),
-        key=lambda item: (item[1].visit_count, item[1].prior),
-    )
+            for search_path, (priors, value) in zip(leaf_paths, eval_results):
+                leaf_node = search_path[-1]
+                if not leaf_node.expanded:
+                    leaf_node.expand(priors)
+                backup_path(search_path, value)
 
-    return best_move
+    chosen_moves: list[chess.Move] = []
+
+    for i, board in enumerate(root_boards):
+        if i in forced_moves:
+            chosen_moves.append(forced_moves[i])
+            continue
+
+        root = roots[i]
+        legal_moves = list(board.legal_moves)
+
+        if not root.children:
+            # Extremely defensive fallback; should not happen except num_simulations=0.
+            chosen_moves.append(legal_moves[0])
+            continue
+
+        best_move, _ = max(
+            root.children.items(),
+            key=lambda item: (item[1].visit_count, item[1].prior),
+        )
+        chosen_moves.append(best_move)
+
+    return chosen_moves
 
 
 # ============================================================
@@ -538,50 +570,24 @@ def score_for_checkpoint(result: str, checkpoint_is_white: bool) -> float:
     return 1.0 if result == "0-1" else 0.0
 
 
-def play_single_eval_game(
+def append_game_to_pgn(
+    pgn_path: Path,
     white_name: str,
-    white_model,
     black_name: str,
-    black_model,
-    device: torch.device,
+    result: str,
+    moves: list[chess.Move],
+    round_name: str,
+    termination: str,
     num_simulations: int,
-    c_puct: float,
-    max_moves: int,
     initial_fen: Optional[str] = None,
-) -> tuple[str, list[chess.Move], str]:
-    board = chess.Board(initial_fen) if initial_fen else chess.Board()
-    played_moves: list[chess.Move] = []
-
-    while not board.is_game_over(claim_draw=True) and len(played_moves) < max_moves:
-        model = white_model if board.turn == chess.WHITE else black_model
-
-        move = run_eval_mcts(
-            model=model,
-            root_board=board,
-            device=device,
-            num_simulations=num_simulations,
-            c_puct=c_puct,
-        )
-
-        board.push(move)
-        played_moves.append(move)
-
-    result, termination = result_from_board(board)
-    return result, played_moves, termination
-
-
-# ============================================================
-# PGN writing
-# ============================================================
-
-def append_game_to_pgn(pgn_path: Path, white_name: str, black_name: str, result: str, moves: list[chess.Move], round_name: str, termination: str,
-    num_simulations: int, initial_fen: Optional[str] = None, opening_name: Optional[str] = None) -> None:
+    opening_name: Optional[str] = None,
+) -> None:
     pgn_path.parent.mkdir(parents=True, exist_ok=True)
 
     board = chess.Board(initial_fen) if initial_fen else chess.Board()
 
     game = chess.pgn.Game()
-    game.headers["Event"] = "ChessAgent checkpoint evaluation"
+    game.headers["Event"] = "ChessAgent latest checkpoint evaluation"
     game.headers["Site"] = "Aristotle/Nefeli"
     game.headers["Date"] = datetime.now().strftime("%Y.%m.%d")
     game.headers["Round"] = round_name
@@ -612,6 +618,237 @@ def append_game_to_pgn(pgn_path: Path, white_name: str, black_name: str, result:
 
 
 # ============================================================
+# Starting FEN suite
+# ============================================================
+
+def validate_fen(fen: str) -> bool:
+    try:
+        board = chess.Board(fen)
+        return not board.is_game_over(claim_draw=True) and len(list(board.legal_moves)) > 0
+    except Exception:
+        return False
+
+
+def read_fen_file(path: Path) -> list[tuple[str, str]]:
+    positions: list[tuple[str, str]] = []
+    seen = set()
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line_num, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            if "|" in line:
+                name, fen = [part.strip() for part in line.split("|", 1)]
+            else:
+                name = f"FEN_{line_num}"
+                fen = line
+
+            if not validate_fen(fen):
+                print(f"[eval] skipped invalid/non-playable FEN line {line_num}: {fen}", flush=True)
+                continue
+
+            key = chess.Board(fen).board_fen() + " " + ("w" if chess.Board(fen).turn else "b")
+            if key in seen:
+                continue
+            seen.add(key)
+            positions.append((name, fen))
+
+    return positions
+
+
+def opening_move_score(board: chess.Board, move: chess.Move) -> float:
+    """
+    Lightweight deterministic heuristic for generating legal, opening-like FENs.
+    This is NOT used for evaluation play. It only builds a fixed diverse FEN suite.
+    """
+
+    piece = board.piece_at(move.from_square)
+    if piece is None:
+        return 0.0
+
+    score = 1.0
+    to_file = chess.square_file(move.to_square)
+    to_rank = chess.square_rank(move.to_square)
+    to_center_distance = abs(to_file - 3.5) + abs(to_rank - 3.5)
+
+    score += max(0.0, 4.0 - to_center_distance) * 0.25
+
+    if board.is_capture(move):
+        score += 0.20
+
+    if board.is_castling(move):
+        score += 1.30
+
+    if piece.piece_type == chess.PAWN:
+        # Prefer central pawn moves in the opening.
+        if chess.square_file(move.from_square) in (3, 4):
+            score += 1.10
+        elif chess.square_file(move.from_square) in (2, 5):
+            score += 0.45
+        else:
+            score += 0.05
+
+    elif piece.piece_type in (chess.KNIGHT, chess.BISHOP):
+        # Prefer developing minor pieces from the back rank.
+        from_rank = chess.square_rank(move.from_square)
+        home_rank = 0 if piece.color == chess.WHITE else 7
+        if from_rank == home_rank:
+            score += 1.00
+        else:
+            score += 0.15
+
+    elif piece.piece_type == chess.QUEEN:
+        # Avoid too many early queen moves when generating opening FENs.
+        score -= 0.60
+
+    elif piece.piece_type == chess.KING and not board.is_castling(move):
+        score -= 0.80
+
+    return max(0.01, score)
+
+
+def generate_opening_fens(
+    target_count: int,
+    seed: int,
+    min_plies: int,
+    max_plies: int,
+) -> list[tuple[str, str]]:
+    """
+    Generates a deterministic legal FEN suite.
+
+    This avoids repeating deterministic eval games when --games is large.
+    For a more chess-theoretically curated suite, pass --fen-file later.
+    """
+
+    rng = random.Random(seed)
+    positions: list[tuple[str, str]] = []
+    seen = set()
+    attempts = 0
+    max_attempts = max(10_000, target_count * 200)
+
+    while len(positions) < target_count and attempts < max_attempts:
+        attempts += 1
+        board = chess.Board()
+        target_plies = rng.randint(min_plies, max_plies)
+
+        for _ in range(target_plies):
+            if board.is_game_over(claim_draw=True):
+                break
+
+            legal_moves = list(board.legal_moves)
+            if not legal_moves:
+                break
+
+            scored = []
+            for move in legal_moves:
+                score = opening_move_score(board, move)
+                # Deterministic randomness from rng; helps generate a diverse suite.
+                score *= rng.uniform(0.50, 1.50)
+                scored.append((score, move))
+
+            scored.sort(key=lambda item: item[0], reverse=True)
+            top_k = min(len(scored), 8)
+            top_scores = [max(0.01, s) for s, _ in scored[:top_k]]
+            top_moves = [m for _, m in scored[:top_k]]
+            move = rng.choices(top_moves, weights=top_scores, k=1)[0]
+            board.push(move)
+
+        if board.is_game_over(claim_draw=True) or not list(board.legal_moves):
+            continue
+
+        fen = board.fen()
+        key = board.board_fen() + " " + ("w" if board.turn else "b")
+        if key in seen:
+            continue
+
+        seen.add(key)
+        positions.append((f"GeneratedOpening_{len(positions) + 1}", fen))
+
+    if len(positions) < target_count:
+        print(
+            f"[eval] WARNING: generated only {len(positions)}/{target_count} FENs.",
+            flush=True,
+        )
+
+    return positions
+
+
+def build_starting_positions(args) -> list[tuple[Optional[str], Optional[str]]]:
+    if args.no_starting_fens:
+        return [(None, None)]
+
+    needed_pairs = max(1, math.ceil(args.games / 2))
+
+    positions: list[tuple[str, str]] = []
+    seen = set()
+
+    def add_position(name: str, fen: str) -> None:
+        if not validate_fen(fen):
+            return
+        board = chess.Board(fen)
+        key = board.board_fen() + " " + ("w" if board.turn else "b")
+        if key in seen:
+            return
+        seen.add(key)
+        positions.append((name, fen))
+
+    if args.fen_file is not None:
+        for name, fen in read_fen_file(Path(args.fen_file)):
+            add_position(name, fen)
+    else:
+        for name, fen in BASE_STARTING_POSITIONS:
+            add_position(name, fen)
+
+    if args.auto_generate_fens and len(positions) < needed_pairs:
+        generated = generate_opening_fens(
+            target_count=needed_pairs - len(positions),
+            seed=args.fen_seed,
+            min_plies=args.generated_min_plies,
+            max_plies=args.generated_max_plies,
+        )
+        for name, fen in generated:
+            add_position(name, fen)
+
+    if len(positions) == 0:
+        print("[eval] WARNING: no valid starting FENs available; using normal start position.", flush=True)
+        return [(None, None)]
+
+    if len(positions) < needed_pairs:
+        print(
+            f"[eval] WARNING: only {len(positions)} unique FENs for {args.games} games/match. "
+            f"Deterministic games may repeat after {2 * len(positions)} games/match.",
+            flush=True,
+        )
+    else:
+        print(
+            f"[eval] using {needed_pairs} FEN pairs for {args.games} games/match "
+            f"from {len(positions)} available positions.",
+            flush=True,
+        )
+
+    return positions[:needed_pairs]
+
+
+def select_starting_position(
+    game_idx: int,
+    starting_positions: list[tuple[Optional[str], Optional[str]]],
+) -> tuple[Optional[str], Optional[str]]:
+    if len(starting_positions) == 0:
+        return None, None
+
+    # Games are paired by FEN:
+    #   game 0 -> FEN 0 with checkpoint as White
+    #   game 1 -> FEN 0 with checkpoint as Black
+    #   game 2 -> FEN 1 with checkpoint as White
+    #   game 3 -> FEN 1 with checkpoint as Black
+    fen_pair_idx = game_idx // 2
+    return starting_positions[fen_pair_idx % len(starting_positions)]
+
+
+# ============================================================
 # CSV summary
 # ============================================================
 
@@ -626,19 +863,12 @@ CSV_FIELDS = [
     "elo_delta",
     "sims",
     "step",
+    "fen_count",
     "updated_at",
 ]
 
 
 def elo_delta_from_score(score: float, eps: float = 1e-4) -> float:
-    """
-    Approximate two-player Elo delta:
-
-        400 * log10(score / (1 - score))
-
-    Clamped to avoid infinite values for 0% or 100%.
-    """
-
     score = max(eps, min(1.0 - eps, score))
     return 400.0 * math.log10(score / (1.0 - score))
 
@@ -698,6 +928,7 @@ def make_result_row(
     losses: int,
     sims: int,
     step: int,
+    fen_count: int,
 ) -> dict:
     games = wins + draws + losses
 
@@ -719,12 +950,13 @@ def make_result_row(
         "elo_delta": f"{elo_delta:.2f}",
         "sims": str(sims),
         "step": str(step),
+        "fen_count": str(fen_count),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 
 # ============================================================
-# Finding checkpoints and building match graph
+# Finding checkpoints and building latest-only match graph
 # ============================================================
 
 def parse_iteration_from_path(path: Path) -> Optional[int]:
@@ -738,13 +970,13 @@ def parse_iteration_from_path(path: Path) -> Optional[int]:
 
 def find_model_after_sl() -> Path:
     candidates = [
-    Path(MODEL_AFTER_SL_PATH),
-    Path(RL_MODEL_DIR) / "model_after_sl.pt",
-    Path(OUTPUT_DIR) / "rl_models" / "model_after_sl.pt",
+        Path(MODEL_AFTER_SL_PATH),
+        Path(RL_MODEL_DIR) / "model_after_sl.pt",
+        Path(OUTPUT_DIR) / "rl_models" / "model_after_sl.pt",
 
-    # Legacy fallback from old layout
-    Path(RL_CHECKPOINT_DIR) / "model_after_sl.pt",
-    Path(OUTPUT_DIR) / "rl_checkpoints" / "model_after_sl.pt",
+        # Legacy fallback from old layout.
+        Path(RL_CHECKPOINT_DIR) / "model_after_sl.pt",
+        Path(OUTPUT_DIR) / "rl_checkpoints" / "model_after_sl.pt",
     ]
 
     for path in candidates:
@@ -793,107 +1025,187 @@ def find_eval_checkpoints(step: int) -> tuple[EvalCheckpoint, list[EvalCheckpoin
     return baseline, checkpoints
 
 
-def build_match_plan(
+def build_latest_match_plan(
     baseline: EvalCheckpoint,
     checkpoints: list[EvalCheckpoint],
     step: int,
 ) -> list[tuple[EvalCheckpoint, EvalCheckpoint]]:
     """
-    Returns matches as:
+    Returns only the monitoring matches the user asked for:
 
-        checkpoint vs opponent
+        latest model_iter_N vs model_after_sl
+        latest model_iter_N vs model_iter_(N-step), if available
 
-    CSV is always from checkpoint's perspective.
-
-    Example with step=5:
-
-        model_iter_5  vs model_after_sl
-        model_iter_10 vs model_after_sl
-        model_iter_10 vs model_iter_5
-        model_iter_15 vs model_after_sl
-        model_iter_15 vs model_iter_10
+    N is the largest available archived checkpoint iteration divisible by step.
     """
 
-    by_iter = {
-        ckpt.iteration: ckpt
-        for ckpt in checkpoints
-        if ckpt.iteration is not None
-    }
+    if not checkpoints:
+        return []
 
-    matches: list[tuple[EvalCheckpoint, EvalCheckpoint]] = []
+    latest = max(
+        checkpoints,
+        key=lambda ckpt: -1 if ckpt.iteration is None else ckpt.iteration,
+    )
 
-    for ckpt in checkpoints:
-        # Fixed baseline match.
-        matches.append((ckpt, baseline))
+    matches = [(latest, baseline)]
 
-        # Adjacent checkpoint match.
-        if ckpt.iteration is not None:
-            previous_iteration = ckpt.iteration - step
-            previous_ckpt = by_iter.get(previous_iteration)
+    if latest.iteration is not None:
+        previous_iteration = latest.iteration - step
+        previous = next(
+            (ckpt for ckpt in checkpoints if ckpt.iteration == previous_iteration),
+            None,
+        )
 
-            if previous_ckpt is not None:
-                matches.append((ckpt, previous_ckpt))
+        if previous is not None:
+            matches.append((latest, previous))
+        else:
+            print(
+                f"[eval] previous checkpoint model_iter_{previous_iteration}.pt not found; "
+                f"latest-vs-previous match will be skipped.",
+                flush=True,
+            )
 
-    # Remove accidental duplicates.
-    seen = set()
-    unique_matches = []
-
-    for checkpoint, opponent in matches:
-        key = (checkpoint.name, opponent.name)
-
-        if key in seen:
-            continue
-
-        if checkpoint.path.resolve() == opponent.path.resolve():
-            continue
-
-        seen.add(key)
-        unique_matches.append((checkpoint, opponent))
-
-    return unique_matches
+    return matches
 
 
-def select_starting_position(
+# ============================================================
+# Running batched matches
+# ============================================================
+
+def init_active_game(
+    checkpoint: EvalCheckpoint,
+    opponent: EvalCheckpoint,
     game_idx: int,
-    use_starting_fens: bool,
-) -> tuple[Optional[str], Optional[str]]:
-    """
-    Returns (opening_name, fen).
+    starting_positions: list[tuple[Optional[str], Optional[str]]],
+) -> ActiveEvalGame:
+    opening_name, initial_fen = select_starting_position(game_idx, starting_positions)
+    board = chess.Board(initial_fen) if initial_fen else chess.Board()
 
-    We pair games by FEN:
-      game 0 and 1 use FEN 0,
-      game 2 and 3 use FEN 1,
-      etc.
+    checkpoint_is_white = (game_idx % 2 == 0)
 
-    This guarantees that each FEN is played once with the checkpoint as White
-    and once with the checkpoint as Black before moving to the next FEN.
-    """
+    if checkpoint_is_white:
+        white_name = checkpoint.name
+        black_name = opponent.name
+    else:
+        white_name = opponent.name
+        black_name = checkpoint.name
 
-    if not use_starting_fens or len(STARTING_POSITIONS) == 0:
-        return None, None
+    return ActiveEvalGame(
+        game_idx=game_idx,
+        board=board,
+        played_moves=[],
+        checkpoint_is_white=checkpoint_is_white,
+        white_name=white_name,
+        black_name=black_name,
+        opening_name=opening_name,
+        initial_fen=initial_fen,
+    )
 
-    fen_pair_idx = game_idx // 2
-    opening_name, fen = STARTING_POSITIONS[
-        fen_pair_idx % len(STARTING_POSITIONS)
+
+def finalize_active_game(game: ActiveEvalGame) -> None:
+    if game.done:
+        return
+
+    result, termination = result_from_board(game.board)
+    game.result = result
+    game.termination = termination
+    game.done = True
+
+
+def play_eval_game_batch(
+    checkpoint: EvalCheckpoint,
+    opponent: EvalCheckpoint,
+    model_checkpoint,
+    model_opponent,
+    game_indices: list[int],
+    starting_positions: list[tuple[Optional[str], Optional[str]]],
+    num_simulations: int,
+    c_puct: float,
+    max_moves: int,
+    device: torch.device,
+) -> list[ActiveEvalGame]:
+    games = [
+        init_active_game(
+            checkpoint=checkpoint,
+            opponent=opponent,
+            game_idx=game_idx,
+            starting_positions=starting_positions,
+        )
+        for game_idx in game_indices
     ]
 
-    return opening_name, fen
+    for _ply in range(max_moves):
+        active_games = [
+            game for game in games
+            if not game.done and not game.board.is_game_over(claim_draw=True)
+        ]
 
-# ============================================================
-# Running matches
-# ============================================================
+        if not active_games:
+            break
 
-def play_eval_match(checkpoint: EvalCheckpoint, opponent: EvalCheckpoint, existing_row: Optional[dict], target_games: int, num_simulations: int, c_puct: float,
-    max_moves: int, device: torch.device, pgn_path: Path, step: int, use_starting_fens: bool) -> dict:
+        checkpoint_games = []
+        opponent_games = []
+
+        for game in active_games:
+            # If checkpoint is White, it moves on white turns; otherwise on black turns.
+            checkpoint_to_move = (game.board.turn == chess.WHITE) == game.checkpoint_is_white
+
+            if checkpoint_to_move:
+                checkpoint_games.append(game)
+            else:
+                opponent_games.append(game)
+
+        for group_games, model in ((checkpoint_games, model_checkpoint), (opponent_games, model_opponent)):
+            if not group_games:
+                continue
+
+            boards = [game.board for game in group_games]
+            moves = run_eval_mcts_batch(
+                model=model,
+                root_boards=boards,
+                device=device,
+                num_simulations=num_simulations,
+                c_puct=c_puct,
+            )
+
+            for game, move in zip(group_games, moves):
+                game.board.push(move)
+                game.played_moves.append(move)
+
+                if game.board.is_game_over(claim_draw=True):
+                    finalize_active_game(game)
+
+    for game in games:
+        finalize_active_game(game)
+
+    return games
+
+
+def play_eval_match(
+    checkpoint: EvalCheckpoint,
+    opponent: EvalCheckpoint,
+    existing_row: Optional[dict],
+    target_games: int,
+    num_simulations: int,
+    c_puct: float,
+    max_moves: int,
+    device: torch.device,
+    pgn_path: Path,
+    step: int,
+    starting_positions: list[tuple[Optional[str], Optional[str]]],
+    batch_games: int,
+) -> dict:
     """
     Plays missing games only.
 
     wins/draws/losses are always from `checkpoint` perspective.
+    Games are evaluated in batches; within each move, boards are grouped by
+    model and each model's MCTS leaf evaluations are batched.
     """
 
-    wins = int(existing_row["wins"]) if existing_row else 0
-    draws = int(existing_row["draws"]) if existing_row else 0
-    losses = int(existing_row["losses"]) if existing_row else 0
+    wins = int(existing_row.get("wins", 0)) if existing_row else 0
+    draws = int(existing_row.get("draws", 0)) if existing_row else 0
+    losses = int(existing_row.get("losses", 0)) if existing_row else 0
 
     already_done = wins + draws + losses
     remaining = target_games - already_done
@@ -901,62 +1213,94 @@ def play_eval_match(checkpoint: EvalCheckpoint, opponent: EvalCheckpoint, existi
     if remaining <= 0:
         return existing_row
 
-    print(f"[eval] {checkpoint.name} vs {opponent.name}: " f"{already_done}/{target_games} already done, " f"playing {remaining} games.", flush=True)
+    print(
+        f"[eval] {checkpoint.name} vs {opponent.name}: "
+        f"{already_done}/{target_games} already done, playing {remaining} games.",
+        flush=True,
+    )
 
     model_checkpoint = load_eval_model(checkpoint.path, device)
     model_opponent = load_eval_model(opponent.path, device)
 
-    for local_game_idx in range(remaining):
-        absolute_game_idx = already_done + local_game_idx
+    t0 = time.time()
+    completed_now = 0
 
-        opening_name, initial_fen = select_starting_position(game_idx=absolute_game_idx, use_starting_fens=use_starting_fens)
+    try:
+        for batch_start in range(already_done, target_games, batch_games):
+            batch_end = min(target_games, batch_start + batch_games)
+            game_indices = list(range(batch_start, batch_end))
 
-        # Alternate colors.
-        checkpoint_is_white = (absolute_game_idx % 2 == 0)
+            batch_results = play_eval_game_batch(
+                checkpoint=checkpoint,
+                opponent=opponent,
+                model_checkpoint=model_checkpoint,
+                model_opponent=model_opponent,
+                game_indices=game_indices,
+                starting_positions=starting_positions,
+                num_simulations=num_simulations,
+                c_puct=c_puct,
+                max_moves=max_moves,
+                device=device,
+            )
 
-        if checkpoint_is_white:
-            white_name = checkpoint.name
-            white_model = model_checkpoint
-            black_name = opponent.name
-            black_model = model_opponent
-        else:
-            white_name = opponent.name
-            white_model = model_opponent
-            black_name = checkpoint.name
-            black_model = model_checkpoint
+            for game in batch_results:
+                if game.result is None or game.termination is None:
+                    raise RuntimeError("Internal error: active game was not finalized.")
 
-        result, moves, termination = play_single_eval_game(white_name=white_name, white_model=white_model, black_name=black_name, black_model=black_model,
-            device=device, num_simulations=num_simulations, c_puct=c_puct, max_moves=max_moves, initial_fen=initial_fen)
+                checkpoint_score = score_for_checkpoint(
+                    result=game.result,
+                    checkpoint_is_white=game.checkpoint_is_white,
+                )
 
-        checkpoint_score = score_for_checkpoint(result=result, checkpoint_is_white=checkpoint_is_white)
+                if checkpoint_score == 1.0:
+                    wins += 1
+                elif checkpoint_score == 0.5:
+                    draws += 1
+                else:
+                    losses += 1
 
-        if checkpoint_score == 1.0:
-            wins += 1
-        elif checkpoint_score == 0.5:
-            draws += 1
-        else:
-            losses += 1
+                opening_tag = (
+                    game.opening_name.replace(" ", "_").replace("'", "")
+                    if game.opening_name else "startpos"
+                )
 
-        opening_tag = (opening_name.replace(" ", "_").replace("'", "") if opening_name else "startpos")
+                round_name = (
+                    f"{checkpoint.name}_vs_{opponent.name}_"
+                    f"{game.game_idx + 1}_{opening_tag}"
+                )
 
-        round_name = (f"{checkpoint.name}_vs_{opponent.name}_" f"{absolute_game_idx + 1}_{opening_tag}")
+                append_game_to_pgn(
+                    pgn_path=pgn_path,
+                    white_name=game.white_name,
+                    black_name=game.black_name,
+                    result=game.result,
+                    moves=game.played_moves,
+                    round_name=round_name,
+                    termination=game.termination,
+                    num_simulations=num_simulations,
+                    initial_fen=game.initial_fen,
+                    opening_name=game.opening_name,
+                )
 
-        append_game_to_pgn(pgn_path=pgn_path, white_name=white_name, black_name=black_name, result=result, moves=moves, round_name=round_name,
-            termination=termination, num_simulations=num_simulations, initial_fen=initial_fen, opening_name=opening_name)
+            completed_now += len(batch_results)
+            total_done = already_done + completed_now
+            elapsed = max(1e-9, time.time() - t0)
+            games_per_min = completed_now / elapsed * 60.0
 
-        print(
-            f"[eval] game {absolute_game_idx + 1}/{target_games}: "
-            f"{white_name} vs {black_name} {result} | "
-            f"opening={opening_name or 'startpos'} | "
-            f"{checkpoint.name} W/D/L = {wins}/{draws}/{losses}",
-            flush=True,
-        )
+            print(
+                f"[eval] {checkpoint.name} vs {opponent.name}: "
+                f"{total_done}/{target_games} games | "
+                f"W/D/L={wins}/{draws}/{losses} | "
+                f"{games_per_min:.2f} games/min",
+                flush=True,
+            )
 
-    del model_checkpoint
-    del model_opponent
+    finally:
+        del model_checkpoint
+        del model_opponent
 
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     return make_result_row(
         checkpoint_name=checkpoint.name,
@@ -966,6 +1310,7 @@ def play_eval_match(checkpoint: EvalCheckpoint, opponent: EvalCheckpoint, existi
         losses=losses,
         sims=num_simulations,
         step=step,
+        fen_count=len(starting_positions),
     )
 
 
@@ -1020,23 +1365,30 @@ def run_ordo_if_available(
 def eval_checkpoints(args) -> None:
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
+    if args.reset_output:
+        for path in (EVAL_RESULTS_CSV, EVAL_GAMES_PGN, EVAL_ORDO_RATINGS_TXT):
+            if path.exists():
+                path.unlink()
+                print(f"[eval] deleted old output: {path}", flush=True)
+
     device = torch.device(
         args.device
         if args.device is not None
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
 
+    starting_positions = build_starting_positions(args)
+
     print("=" * 80)
-    print("[eval] Starting checkpoint evaluation")
+    print("[eval] Starting latest checkpoint evaluation")
     print(f"[eval] device: {device}")
     print(f"[eval] games per match: {args.games}")
     print(f"[eval] sims per move: {args.sims}")
     print(f"[eval] step: {args.step}")
-    if args.no_starting_fens:
-        print("[eval] starting FENs: disabled")
-    else:
-        print(f"[eval] starting FENs: {len(STARTING_POSITIONS)}")
+    print(f"[eval] batch games: {args.batch_games}")
+    print(f"[eval] starting FEN pairs available: {len(starting_positions)}")
     print(f"[eval] checkpoint dir: {RL_CHECKPOINT_DIR}")
+    print(f"[eval] model dir: {RL_MODEL_DIR}")
     print(f"[eval] output dir: {EVAL_DIR}")
     print("=" * 80)
 
@@ -1047,12 +1399,12 @@ def eval_checkpoints(args) -> None:
         return
 
     print(f"[eval] baseline: {baseline.name} -> {baseline.path}")
-    print("[eval] found checkpoints:")
+    print("[eval] found archived checkpoints:")
 
     for ckpt in checkpoints:
         print(f"  - {ckpt.name}: {ckpt.path}")
 
-    match_plan = build_match_plan(
+    match_plan = build_latest_match_plan(
         baseline=baseline,
         checkpoints=checkpoints,
         step=args.step,
@@ -1062,8 +1414,7 @@ def eval_checkpoints(args) -> None:
         print("[eval] No valid matches to play.")
         return
 
-    print("[eval] match plan:")
-
+    print("[eval] latest-only match plan:")
     for checkpoint, opponent in match_plan:
         print(f"  - {checkpoint.name} vs {opponent.name}")
 
@@ -1071,13 +1422,12 @@ def eval_checkpoints(args) -> None:
 
     for checkpoint, opponent in match_plan:
         key = (checkpoint.name, opponent.name, args.sims)
-
         existing_row = result_rows.get(key)
 
         if args.force:
             existing_row = None
 
-        current_games = int(existing_row["games"]) if existing_row else 0
+        current_games = int(existing_row.get("games", 0)) if existing_row else 0
 
         if current_games >= args.games and not args.force:
             print(
@@ -1098,7 +1448,8 @@ def eval_checkpoints(args) -> None:
             device=device,
             pgn_path=EVAL_GAMES_PGN,
             step=args.step,
-            use_starting_fens=not args.no_starting_fens,
+            starting_positions=starting_positions,
+            batch_games=args.batch_games,
         )
 
         result_rows[key] = row
@@ -1120,24 +1471,65 @@ def eval_checkpoints(args) -> None:
         )
 
 
+# ============================================================
+# CLI
+# ============================================================
+
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate AlphaZero-style chess checkpoints externally.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate the latest archived AlphaZero-style chess checkpoint."
+    )
 
-    parser.add_argument("--no-starting-fens", action="store_true", help="Disable opening FENs and start every evaluation game from the normal initial chess position.")
-
-    parser.add_argument("--games", type=int, default=40)
-    parser.add_argument("--sims", type=int, default=100)
-    parser.add_argument("--step", type=int, default=5)
+    parser.add_argument(
+        "--games",
+        type=int,
+        default=100,
+        help="Games per match. Total games are usually 2x this, because latest plays SL and previous.",
+    )
+    parser.add_argument("--sims", type=int, default=200, help="MCTS simulations per move.")
+    parser.add_argument("--step", type=int, default=5, help="Archived checkpoint interval, usually 5.")
 
     parser.add_argument("--c-puct", type=float, default=SELFPLAY_C_PUCT)
     parser.add_argument("--max-moves", type=int, default=MAX_GAME_MOVES)
-
     parser.add_argument("--device", type=str, default=None)
+
+    parser.add_argument(
+        "--batch-games",
+        type=int,
+        default=32,
+        help="How many eval games to keep active at once. Increase for better batching; decrease if RAM is high.",
+    )
+
+    parser.add_argument(
+        "--no-starting-fens",
+        action="store_true",
+        help="Disable starting FENs and start every evaluation game from the normal initial chess position.",
+    )
+    parser.add_argument(
+        "--fen-file",
+        type=str,
+        default=None,
+        help="Optional file with curated FENs. Format: either plain FEN or Name | FEN per line.",
+    )
+    parser.add_argument(
+        "--auto-generate-fens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-generate deterministic legal opening FENs if the built-in/fen-file suite is too small.",
+    )
+    parser.add_argument("--fen-seed", type=int, default=12345)
+    parser.add_argument("--generated-min-plies", type=int, default=6)
+    parser.add_argument("--generated-max-plies", type=int, default=14)
 
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Replay matches from scratch in CSV perspective. PGN will still append.",
+        help="Replay matches from scratch in CSV perspective. PGN will still append unless --reset-output is also set.",
+    )
+    parser.add_argument(
+        "--reset-output",
+        action="store_true",
+        help="Delete eval_latest_results.csv, eval_latest_games.pgn and ordo_latest_ratings.txt before running.",
     )
 
     parser.add_argument(
@@ -1145,7 +1537,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip Ordo even if it is installed.",
     )
-
     parser.add_argument("--ordo-bin", type=str, default="ordo")
     parser.add_argument("--ordo-average", type=int, default=0)
 
@@ -1155,6 +1546,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    if args.games <= 0:
+        raise ValueError("--games must be positive.")
+    if args.sims < 0:
+        raise ValueError("--sims must be non-negative.")
+    if args.step <= 0:
+        raise ValueError("--step must be positive.")
+    if args.batch_games <= 0:
+        raise ValueError("--batch-games must be positive.")
+    if args.generated_min_plies < 0 or args.generated_max_plies < args.generated_min_plies:
+        raise ValueError("Invalid generated ply range.")
+
     eval_checkpoints(args)
 
 

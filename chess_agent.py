@@ -1,3 +1,14 @@
+"""
+chess_agent.py
+
+AlphaZero-style chess agent with:
+- Supervised pretraining
+- Parallel self-play workers
+- GPU inference server
+- Replay-buffer RL training
+- External checkpoint evaluation
+"""
+
 import os
 import math
 import time
@@ -23,7 +34,7 @@ import torch.multiprocessing as mp
 
 
 # ============================================================
-# Nefeli Runtime Config
+# Runtime Config
 # ============================================================
 
 PROJECT_DIR = Path.home() / "chess-agent-aristotle"
@@ -112,17 +123,15 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
     torch.backends.cudnn.benchmark = True
 
-# SL values are kept only for checkpoint compatibility / shared model config.
 WEIGHT_DECAY = 1e-4
-VALUE_LOSS_WEIGHT = 0.5
+VALUE_LOSS_WEIGHT = 1.0
 
-# Nefeli RL settings.
-# These are intentionally larger than Colab, but still conservative for a first stable run.
-RL_ITERATIONS = 3
-REPLAY_BUFFER_SIZE = 200_000
-GAMES_PER_ITERATION = 128
-SELFPLAY_SIMS = 150
-RL_BATCH_SIZE = 512
+# Aristotle ampere partition RL settings.
+RL_ITERATIONS = 10
+REPLAY_BUFFER_SIZE = 500_000
+GAMES_PER_ITERATION = 512
+SELFPLAY_SIMS = 600
+RL_BATCH_SIZE = 1024
 RL_LR = 1e-4
 SELFPLAY_C_PUCT = 1.5
 MAX_GAME_MOVES = 250
@@ -133,10 +142,10 @@ ROOT_DIRICHLET_EPSILON = 0.25
 # Parallel self-play with inference server
 PARALLEL_SELFPLAY = True
 
-SELFPLAY_WORKERS = 8          # test with 4 first, then 8/16/24
-WORKER_VECTOR_GAMES = 2        # active games per worker
-INFER_SERVER_BATCH_SIZE = 16  # target GPU inference batch
-INFER_SERVER_TIMEOUT_MS = 5    # max wait before flushing partial batch
+SELFPLAY_WORKERS = 64     # parallel CPU workers for self-play
+WORKER_VECTOR_GAMES = 4        # active games per worker
+INFER_SERVER_BATCH_SIZE = 160  # target GPU inference batch
+INFER_SERVER_TIMEOUT_MS = 3    # max wait before flushing partial batch
 
 # Policy training. When enabled, the policy loss softmax is computed only
 # over legal moves, matching the legal-move masking used by MCTS.
@@ -145,10 +154,10 @@ POLICY_MASK_VALUE = -1e4
 
 # Dynamic fixed-step RL training schedule based on new self-play samples.
 RL_REUSE_FACTOR = 4
-RL_TRAIN_MIN_STEPS = 10
-RL_TRAIN_MAX_STEPS = 200
+RL_TRAIN_MIN_STEPS = 100
+RL_TRAIN_MAX_STEPS = 1000
 
-NUM_WORKERS = 2     # For DataLoaders
+NUM_WORKERS = 4     # For DataLoaders
 
 DEFAULT_PGN_PATH = DATA_DIR / "lichess_elite_2024-07.pgn"
 
