@@ -69,23 +69,11 @@ board_to_tensor = chess_agent.board_to_tensor
 NUM_MOVES = getattr(chess_agent, "NUM_MOVES", 4672)
 
 OUTPUT_DIR = getattr(chess_agent, "OUTPUT_DIR", Path("outputs"))
-RL_MODEL_DIR = getattr(
-    chess_agent,
-    "RL_MODEL_DIR",
-    OUTPUT_DIR / "rl_models",
-)
+RL_MODEL_DIR = getattr(chess_agent, "RL_MODEL_DIR", OUTPUT_DIR / "rl_models")
 
-RL_CHECKPOINT_DIR = getattr(
-    chess_agent,
-    "RL_CHECKPOINT_DIR",
-    OUTPUT_DIR / "rl_checkpoints",
-)
+RL_CHECKPOINT_DIR = getattr(chess_agent, "RL_CHECKPOINT_DIR", OUTPUT_DIR / "rl_checkpoints")
 
-MODEL_AFTER_SL_PATH = getattr(
-    chess_agent,
-    "MODEL_AFTER_SL_PATH",
-    RL_CHECKPOINT_DIR / "model_after_sl.pt",
-)
+MODEL_AFTER_SL_PATH = getattr(chess_agent, "MODEL_AFTER_SL_PATH", RL_CHECKPOINT_DIR / "model_after_sl.pt")
 
 SELFPLAY_C_PUCT = getattr(chess_agent, "SELFPLAY_C_PUCT", 1.5)
 MAX_GAME_MOVES = getattr(chess_agent, "MAX_GAME_MOVES", 250)

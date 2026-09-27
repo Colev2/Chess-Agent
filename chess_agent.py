@@ -176,49 +176,129 @@ SL_VALUE_LOSS_WEIGHT = 0.5
 # ============================================================
 
 PIECE_TYPE_TO_IDX = {
-    chess.PAWN: 0,
-    chess.KNIGHT: 1,
-    chess.BISHOP: 2,
-    chess.ROOK: 3,
-    chess.QUEEN: 4,
-    chess.KING: 5,
+    chess.PAWN: 0,      # 1: 0
+    chess.KNIGHT: 1,    # 2: 1
+    chess.BISHOP: 2,    # 3: 2
+    chess.ROOK: 3,      # 4: 3
+    chess.QUEEN: 4,     # 5: 4
+    chess.KING: 5,      # 6: 5
 }
 
-
-def orient_square(square: chess.Square, turn: chess.Color) -> chess.Square:
-    return square if turn == chess.WHITE else chess.square_mirror(square)
-
-
+# Put the player that has the move always on the "bottom" of the tensor, and the opponent on "top" 
+# In other words, tensor-wise, opponent starts from rows 0,1,... and player who has the turn
+# 7,6,...
+# If black has the move, his squares are already indexed 7,6,5,... so we don't need to do 7-square_rank
 def square_to_row_col_canonical(square: chess.Square, turn: chess.Color):
-    sq = orient_square(square, turn)
-    row = 7 - chess.square_rank(sq)
-    col = chess.square_file(sq)
+    row = chess.square_rank(square)
+    if turn:
+        row = 7 - chess.square_rank(square)
+    col = chess.square_file(square)
     return row, col
 
 
-def board_to_tensor(board: chess.Board) -> np.ndarray:
-    x = np.zeros((17, 8, 8), dtype=np.float32)
+def encode_snapshot(x: np.ndarray, snapshot: chess.Board, perspective: chess.Color, snapshot_idx: int,
+                            occurrence_count: int) -> None:
+    """
+    Encodes one historical chess position into its 14-plane block inside x.
+
+    The position is oriented and its pieces are grouped from the perspective
+    of the player to move in the current position being encoded.
+
+    Parameters
+    ----------
+    x:
+        Output array with shape (119, 8, 8). This function modifies it
+        in place by writing the 14 planes corresponding to this snapshot.
+
+    snapshot:
+        The historical board position whose pieces will be encoded.
+
+    perspective:
+        Colour of the player to move in the current position.
+        The same perspective is used for all historical snapshots, even if black
+        has the move in previous positions
+
+    snapshot_idx:
+        Position of this snapshot within the encoded history. It determines
+        the first channel of its 14-plane block through snapshot_idx * 14.
+
+    occurrence_count:
+        Total number of times this position has occurred up to and including
+        this snapshot.
+
+    Returns
+    -------
+    None
+        The result is written directly into x.
+    """
+    offset = snapshot_idx * 14   # Starting channel of this snapshot's 14-plane block
+
+    # board.piece_map() is a dictionary whose keys are the indexes of the squares the pieces on the current
+    # board sit on. E.g: initial board: {63: r <class chess.Piece>,..., 48: p <class chess.Piece>, 15: P <//>, ..., 0: R <//>}
+    # We get its keys and value pairs with items()
+    for square, piece in snapshot.piece_map().items():
+        row, col = square_to_row_col_canonical(square, perspective)
+
+        # The current perspective always occupies piece planes 0-5
+        if piece.color == perspective: 
+            base = 0
+        else:
+            base = 6
+        # e.g WHEN WHITE IS TO MOVE: white rook: plane = PIECE_TYPE_TO_IDX[piece.piece_type=4] (=3) + base (=0) = 3
+        # black rook: plane = PIECE_TYPE_TO_IDX[piece.piece_type=4] (=3) + base (=6) = 9
+        # If BLACK is TO MOVE, base is 0 for the black pieces and the first planes (0,1,2,..) contain the black pieces
+        plane = base + PIECE_TYPE_TO_IDX[piece.piece_type]  # piece.piece_type is integer
+        x[offset + plane, row, col] = 1.0
+
+    # 2 repetition planes
+    if occurrence_count >= 2:
+        x[offset + 12, :, :] = 1.0
+
+    if occurrence_count >= 3:
+        x[offset + 13, :, :] = 1.0
+
+
+def board_to_tensor(board: chess.Board, history: list[chess.Board], occurrence_counts: list[int]) -> np.ndarray:
+    x = np.zeros((119, 8, 8), dtype=np.float32)
     turn = board.turn
 
-    for square, piece in board.piece_map().items():
-        row, col = square_to_row_col_canonical(square, turn)
-        base = 0 if piece.color == turn else 6
-        plane = base + PIECE_TYPE_TO_IDX[piece.piece_type]
-        x[plane, row, col] = 1.0
+    perspective = board.turn
 
-    if board.ep_square is not None:
-        row, col = square_to_row_col_canonical(board.ep_square, turn)
-        x[12, row, col] = 1.0
+    for i, snapshot in enumerate(history[:8]):
+        encode_snapshot(x, snapshot, perspective, snapshot_idx=i, occurrence_count=occurrence_counts[i])
+
+    # Castle planes
 
     opponent = not turn
     if board.has_kingside_castling_rights(turn):
-        x[13, :, :] = 1.0
+        x[112, :, :] = 1.0
     if board.has_queenside_castling_rights(turn):
-        x[14, :, :] = 1.0
+        x[113, :, :] = 1.0
     if board.has_kingside_castling_rights(opponent):
-        x[15, :, :] = 1.0
+        x[114, :, :] = 1.0
     if board.has_queenside_castling_rights(opponent):
-        x[16, :, :] = 1.0
+        x[115, :, :] = 1.0
+
+
+    # En-passant plane
+
+    if board.ep_square is not None:
+        row, col = square_to_row_col_canonical(board.ep_square, turn)
+        x[116, row, col] = 1.0
+
+
+    # Halfmove clock plane
+
+    x[117, :, :] = min(board.halfmove_clock, 100) / 100.0
+
+
+    # Absolute Color plane
+    
+    if board.turn == chess.WHITE:
+        x[118, :, :] = 1.0
+    else:
+        x[118, :, :] = 0.0
+
 
     return x
 
@@ -227,47 +307,77 @@ def board_to_tensor(board: chess.Board) -> np.ndarray:
 # Move Encoding
 # ============================================================
 
-QUEEN_DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+QUEEN_DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]     # (dr,dc)
 KNIGHT_DIRS = [(2, 1), (1, 2), (-1, 2), (-2, 1), (-2, -1), (-1, -2), (1, -2), (2, -1)]
 UNDERPROMOTIONS = [chess.KNIGHT, chess.BISHOP, chess.ROOK]
 
 NUM_MOVE_PLANES = 73
 NUM_MOVES = 8 * 8 * NUM_MOVE_PLANES
 
-
-def canonical_square(square: chess.Square, turn: chess.Color):
-    return square if turn == chess.WHITE else chess.square_mirror(square)
-
-
-def square_to_row_col_from_oriented_square(square: chess.Square):
-    row = 7 - chess.square_rank(square)
-    col = chess.square_file(square)
-    return row, col
-
+# Convert move to an integer in 0-4671 for the Neural Network
 
 def move_to_id(move: chess.Move, board: chess.Board) -> int:
+    """
+    Encodes a chess move as an integer ID in the range [0, 4672).
+
+    The move is first expressed in canonical coordinates from the perspective
+    of the player to move. Its ID is determined by its starting square and one
+    of 73 move-type planes:
+
+    0...55: queen-like moves (8 directions * 7 distances)
+    56...63: knight moves
+    64...72: underpromotions (3 pieces * 3 directions)
+
+    Queen promotions are encoded as ordinary queen-like moves.
+
+    Parameters
+    ----------
+    move:
+        The move to encode. Its origin, destination and optional promotion
+        piece are used. The function assumes that the move is legal or at
+        least valid for the supplied board; it does not check legality.
+
+    board:
+        The position in which the move is made. Its ``turn`` determines the
+        canonical orientation. The board is not modified.
+
+    Returns
+    -------
+    int
+        The move ID, calculated as:
+
+            starting_square_index * 73 + move_type_index
+
+        where ``starting_square_index`` is in [0, 64) and
+        ``move_type_index`` is in [0, 73).
+
+    Raises
+    ------
+    ValueError
+        If the move does not match any supported queen-like, knight or
+        underpromotion encoding.
+    """
     turn = board.turn
 
-    from_sq = canonical_square(move.from_square, turn)
-    to_sq = canonical_square(move.to_square, turn)
-
-    from_row, from_col = square_to_row_col_from_oriented_square(from_sq)
-    to_row, to_col = square_to_row_col_from_oriented_square(to_sq)
+    from_row, from_col = square_to_row_col_canonical(move.from_square, turn)
+    to_row, to_col = square_to_row_col_canonical(move.to_square, turn)
 
     dr = to_row - from_row
     dc = to_col - from_col
 
-    if move.promotion in [None, chess.QUEEN]:
+    if move.promotion in [None, chess.QUEEN]:   # if move is not a promotion, or is a queen promotion
         for dir_idx, (step_r, step_c) in enumerate(QUEEN_DIRS):
             for dist in range(1, 8):
                 if dr == step_r * dist and dc == step_c * dist:
-                    plane = dir_idx * 7 + (dist - 1)
-                    return (from_row * 8 + from_col) * NUM_MOVE_PLANES + plane
+                    plane = dir_idx * 7 + (dist - 1)        # 0-55
+                    move_id = (from_row * 8 + from_col) * NUM_MOVE_PLANES + plane   # 0-4654
+                    return move_id
 
         for knight_idx, (step_r, step_c) in enumerate(KNIGHT_DIRS):
             if dr == step_r and dc == step_c:
-                plane = 56 + knight_idx
-                return (from_row * 8 + from_col) * NUM_MOVE_PLANES + plane
+                plane = 56 + knight_idx     # 56-63
+                move_id = (from_row * 8 + from_col) * NUM_MOVE_PLANES + plane   # 56-4662
+                return move_id
 
     if move.promotion in UNDERPROMOTIONS:
         promotion_piece_idx = UNDERPROMOTIONS.index(move.promotion)
@@ -282,17 +392,18 @@ def move_to_id(move: chess.Move, board: chess.Board) -> int:
             raise ValueError(f"Invalid underpromotion move: {move}")
 
         plane = 64 + promotion_piece_idx * 3 + direction_idx
-        return (from_row * 8 + from_col) * NUM_MOVE_PLANES + plane
+        move_id = (from_row * 8 + from_col) * NUM_MOVE_PLANES + plane   # 64-4671
+        return move_id
 
     raise ValueError(f"Move cannot be encoded: {move}")
 
 
 def legal_moves_mask(board: chess.Board) -> np.ndarray:
-    mask = np.zeros(NUM_MOVES, dtype=np.bool_)
+    mask = np.zeros(NUM_MOVES, dtype=np.bool_)      # 4672 boolean elements
 
     for legal_move in board.legal_moves:
-        move_id = move_to_id(legal_move, board)
-        mask[move_id] = True
+        legal_move_id = move_to_id(legal_move, board)
+        mask[legal_move_id] = True      # True only for the encoded legal moves, False for illegal
 
     return mask
 
@@ -314,7 +425,10 @@ def result_to_value(result: str) -> float:
 
 def value_for_side_to_move(board: chess.Board, game_result: str) -> float:
     white_value = result_to_value(game_result)
-    return white_value if board.turn == chess.WHITE else -white_value
+    if board.turn == chess.WHITE:
+        return white_value
+    else:
+        return -white_value
 
 
 # ============================================================
@@ -324,55 +438,61 @@ def value_for_side_to_move(board: chess.Board, game_result: str) -> float:
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
+        self.residual_branch = nn.Sequential(
+            nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(num_features=channels),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(num_features=channels)
+        )
 
     def forward(self, x):
         residual = x
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
+        x = self.residual_branch(x)     # self.residual_branch.__call__(x)
         x = F.relu(x + residual)
+
         return x
 
 
 class ChessNet(nn.Module):
-    def __init__(self, in_channels=17, channels=128, num_blocks=8):
+    def __init__(self, in_channels=119, channels=128, num_blocks=8):
         super().__init__()
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(),
+        # Input shape: (B,119,8,8)
+        self.input_block = nn.Sequential(
+            nn.Conv2d(in_channels=in_channels, out_channels=channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(num_features=channels),
+            nn.ReLU()
         )
 
-        self.res_blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(num_blocks)])
+        blocks = [ResidualBlock(channels=channels) for _ in range(num_blocks)]
+        self.res_blocks = nn.Sequential(*blocks)    # unpack list
 
         self.policy_head = nn.Sequential(
-            nn.Conv2d(channels, 32, kernel_size=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(in_channels=channels, out_channels=32, kernel_size=1, bias=False),
+            nn.BatchNorm2d(num_features=32),
             nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(32 * 8 * 8, NUM_MOVES),
+            nn.Conv2d(in_channels=32, out_channels=NUM_MOVE_PLANES, kernel_size=1)
         )
 
         self.value_head = nn.Sequential(
-            nn.Conv2d(channels, 16, kernel_size=1, bias=False),
-            nn.BatchNorm2d(16),
+            nn.Conv2d(in_channels=channels, out_channels=16, kernel_size=1, bias=False),
+            nn.BatchNorm2d(num_features=16),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(16 * 8 * 8, 128),
+            nn.Linear(in_features=16 * 8 * 8, out_features=128),
             nn.ReLU(),
             nn.Linear(128, 1),
-            nn.Tanh(),
+            nn.Tanh()
         )
 
     def forward(self, x):
-        x = self.stem(x)
+        x = self.input_block(x)
         x = self.res_blocks(x)
-        policy_logits = self.policy_head(x)
-        value = self.value_head(x).squeeze(1)
+        policy_logits = self.policy_head(x)     # (B, 73, 8, 8)
+        policy_logits = policy_logits.permute(0, 2, 3, 1)   # (B, 8, 8, 73)
+        policy_logits = policy_logits.flatten(start_dim=1)  # (B, 4672)
+        value = self.value_head(x).squeeze(1)   # (B,)
         return policy_logits, value
 
 
@@ -382,28 +502,36 @@ class ChessNet(nn.Module):
 
 
 def save_model_only(model, path, extra=None):
-    payload = {
+    model_info = {
         "model_state_dict": model.state_dict(),
         "config": {
+            "in_channels": 119,
             "channels": 128,
             "num_blocks": 8,
             "num_moves": NUM_MOVES,
         },
     }
     if extra:
-        payload.update(extra)
-    torch.save(payload, path)
+        model_info.update(extra)
+
+    torch.save(model_info, path)
+    
     print("Saved model-only:", path, flush=True)
 
 
 def load_model_checkpoint(path, device):
-    model = ChessNet().to(device)
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+
+    config = ckpt["config"]
+
+    model = ChessNet(in_channels=config["in_channels"], channels=config["channels"], num_blocks=config["num_blocks"]).to(device)
+
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    print("Loaded model:", path, flush=True)
-    return model, ckpt
 
+    print("Loaded model:", path, flush=True)
+
+    return model, ckpt
 
 # ============================================================
 # Dataset
@@ -419,21 +547,13 @@ class SelfPlayDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.data[idx]
 
-        if len(sample) == 4:
-            x, pi, z, legal_mask = sample
-        elif len(sample) == 3:
-            # Backward compatibility for older replay samples without masks.
-            x, pi, z = sample
-            legal_mask = np.ones(NUM_MOVES, dtype=np.bool_)
-        else:
-            raise ValueError(f"Unexpected self-play sample format: len={len(sample)}")
+        x, pi, z, legal_mask = sample
 
-        return (
-            torch.tensor(x, dtype=torch.float32),
-            torch.tensor(pi, dtype=torch.float32),
-            torch.tensor(z, dtype=torch.float32),
-            torch.tensor(legal_mask, dtype=torch.bool),
-        )
+        return (torch.as_tensor(x, dtype=torch.float32),
+            torch.as_tensor(pi, dtype=torch.float32),
+            torch.as_tensor(z, dtype=torch.float32),
+            torch.as_tensor(legal_mask, dtype=torch.bool)
+            )
 
 
 
@@ -454,35 +574,63 @@ class SupervisedShardDataset(Dataset):
         return len(self.move_id)
 
     def __getitem__(self, idx):
-        return (
-            torch.tensor(self.x[idx], dtype=torch.float32),
-            torch.tensor(self.move_id[idx], dtype=torch.long),
-            torch.tensor(self.z[idx], dtype=torch.float32),
-            torch.tensor(self.value_weight[idx], dtype=torch.float32),
-            torch.tensor(self.legal_mask[idx], dtype=torch.bool),
+        return (torch.as_tensor(self.x[idx], dtype=torch.float32),
+            torch.as_tensor(self.move_id[idx], dtype=torch.long),
+            torch.as_tensor(self.z[idx], dtype=torch.float32),
+            torch.as_tensor(self.value_weight[idx], dtype=torch.float32),
+            torch.as_tensor(self.legal_mask[idx], dtype=torch.bool),
         )
 
 
-def clear_sl_shards():
-    for path in SL_SHARD_DIR.glob("sl_shard_*.npz"):
-        path.unlink()
+def save_sl_shard(shard_idx: int, x: list[np.ndarray], move_ids: list[int], 
+                  z: list[float], value_weights: list[float], legal_masks: list[np.ndarray]):
+    """
+    Saves one supervised-learning dataset shard as an NPZ file.
 
-    meta_path = SL_SHARD_DIR / "metadata.pt"
-    if meta_path.exists():
-        meta_path.unlink()
+    Parameters
+    ----------
+    shard_idx:
+        Sequential index used in the shard's filename.
 
+    x:
+        Board-encoding arrays, each with shape (119, 8, 8).
 
-def save_sl_shard(shard_idx, xs, move_ids, zs, value_weights, legal_masks):
-    if len(xs) == 0:
+    move_ids:
+        Target move IDs, each in the range [0, 4672).
+
+    z:
+        Value targets from the perspective of the player to move.
+        Each value is normally -1.0, 0.0 or +1.0.
+
+    value_weights:
+        Weights controlling how much each sample contributes to the
+        value loss.
+
+    legal_masks:
+        Boolean legal-move masks, each with shape (4672,).
+
+    Returns
+    -------
+    Path | None
+        The path of the saved NPZ file, or None if ``xs`` is empty.
+
+    Notes
+    -----
+    All sample lists must have the same length. This function does not
+    modify the supplied lists or arrays.
+    """
+    if len(x) == 0:
         return None
 
     shard_path = SL_SHARD_DIR / f"sl_shard_{shard_idx:05d}.npz"
 
-    np.savez(shard_path, x=np.stack(xs).astype(np.uint8), move_id=np.array(move_ids, dtype=np.int64), z=np.array(zs, dtype=np.float32),
-                value_weight=np.array(value_weights, dtype=np.float32), legal_mask=np.stack(legal_masks).astype(np.bool_))
+    np.savez(shard_path, x=np.stack(x).astype(np.uint8), move_id=np.array(move_ids, dtype=np.int64), 
+             z=np.array(z, dtype=np.float32), value_weight=np.array(value_weights, dtype=np.float32), 
+             legal_mask=np.stack(legal_masks).astype(np.bool_))
 
 
     print(f"Saved SL shard {shard_idx}: {shard_path} samples={len(move_ids)}", flush=True)
+
     return shard_path
 
 def sample_value_plies(num_plies, min_ply, positions_per_game):
@@ -539,8 +687,6 @@ def prepare_sl_shards_from_pgn(pgn_path, shard_size=SL_SHARD_SIZE, value_min_ply
     print("Shard size:", shard_size, flush=True)
     print("Value min ply:", value_min_ply, flush=True)
     print("Value positions per game:", value_positions_per_game, flush=True)
-
-    clear_sl_shards()
 
     xs = []
     move_ids = []
@@ -896,12 +1042,8 @@ def terminal_value_for_side_to_move(board: chess.Board) -> float:
     if board.is_checkmate():
         return -1.0
 
-    if (
-        board.is_stalemate()
-        or board.is_insufficient_material()
-        or board.can_claim_fifty_moves()
-        or board.can_claim_threefold_repetition()
-    ):
+    if (board.is_stalemate() or board.is_insufficient_material() or board.can_claim_fifty_moves()
+                 or board.can_claim_threefold_repetition()):
         return 0.0
 
     result = board.result(claim_draw=True)
